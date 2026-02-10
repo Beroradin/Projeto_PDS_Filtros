@@ -1,15 +1,49 @@
 import streamlit as st
 import numpy as np
+import gc
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import os
 import io
 from PIL import Image
 
-# Import do processador
-# from src.dsp.processor import SignalProcessor, LMSFilter
-# Como estamos em desenvolvimento, vou usar import relativo
+# ============================================================
+# IMPORTS OTIMIZADOS: cached_ops + plot_utils
+# ============================================================
 from src.dsp.processor import SignalProcessor, LMSFilter
+from src.dsp.cached_ops import (
+    cached_generate_white_noise,
+    cached_generate_impulsive_noise,
+    cached_generate_chirp_noise,
+    cached_generate_high_freq_noise,
+    cached_mix_signals,
+    cached_compute_fft,
+    cached_compute_stft,
+    cached_compute_cwt,
+    cached_design_fir,
+    cached_design_iir,
+    cached_apply_filter,
+    cached_analyze_filter,
+    cached_compute_snr,
+    cached_compute_autocorrelation,
+    cached_compute_histogram,
+    cached_load_audio,
+    cached_lms_filter,
+)
+from src.ui.plot_utils import (
+    downsample_xy,
+    downsample,
+    create_lightweight_figure,
+    plot_signal_lightweight,
+)
+
+# ============================================================
+# Constantes de performance
+# ============================================================
+MAX_PLOT_POINTS = 5000        # Pontos máx por trace no Plotly
+MAX_SPEC_TIME_BINS = 600      # Bins temporais máx para espectrograma
+MAX_CWT_PTS = 4000            # Amostras máx para CWT
+MAX_DURATION_SECONDS = 30     # Duração máx de áudio (trunca se maior)
 
 
 def init_session_state():
@@ -17,24 +51,14 @@ def init_session_state():
     defaults = {
         'signal': np.zeros(1000),
         'sampling_rate': 1000.0,
-        'signal_source': 'none',  # Track signal source to detect changes
-        'last_snr': 10.0,  # Track last SNR to detect changes
-        'last_noise_type': 'Branco',  # Track last noise type
+        'signal_source': 'none',
+        'last_snr': 10.0,
+        'last_noise_type': 'Branco',
     }
     
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
-
-
-def downsample_for_plot(signal, max_points=3000):
-    """Downsamples signal for visualization only. Safe against NaNs."""
-    signal = np.nan_to_num(signal) 
-    N = len(signal)
-    if N > max_points:
-        factor = N // max_points
-        return signal[::factor], factor
-    return signal, 1
 
 
 def safe_audio(signal, fs, label=""):
@@ -49,44 +73,44 @@ def safe_audio(signal, fs, label=""):
         st.warning(f"⚠️ {label} Áudio contém valores inválidos (NaN/Inf). Impossível reproduzir.")
         return
     
-    # Auto-normalization to prevent ear damage
     max_val = np.max(np.abs(signal))
     if max_val > 1.0:
         sig_norm = signal / (max_val + 1e-6)
     else:
         sig_norm = signal
     
-    # Convert to proper format for st.audio
     sig_norm = sig_norm.astype(np.float32)
     st.audio(sig_norm, sample_rate=int(fs))
 
 
 def create_time_domain_plot(signal, fs, title, color, show_envelope=False):
-    """Creates a time domain plot with optional envelope."""
-    s_p, _ = downsample_for_plot(signal, 5000)
-    t = np.linspace(0, len(signal)/fs, len(s_p))
+    """Creates a time domain plot with minmax downsampling and optional envelope."""
+    N = len(signal)
+    t_full = np.linspace(0, N / fs, N)
+    
+    # Downsampling minmax preserva picos
+    t_ds, s_ds = downsample_xy(t_full, signal, max_points=MAX_PLOT_POINTS, method='minmax')
     
     fig = go.Figure()
     fig.add_trace(go.Scattergl(
-        x=t, y=s_p, 
-        mode='lines', 
+        x=t_ds, y=s_ds,
+        mode='lines',
         name='Sinal',
         line=dict(color=color, width=1)
     ))
     
-    if show_envelope and len(s_p) > 100:
-        # Simple envelope using max values in windows
-        window_size = max(1, len(s_p) // 100)
+    if show_envelope and len(s_ds) > 100:
+        window_size = max(1, len(s_ds) // 100)
         envelope_pos = []
         envelope_neg = []
         t_env = []
         
-        for i in range(0, len(s_p), window_size):
-            chunk = s_p[i:i+window_size]
+        for i in range(0, len(s_ds), window_size):
+            chunk = s_ds[i:i+window_size]
             if len(chunk) > 0:
                 envelope_pos.append(np.max(chunk))
                 envelope_neg.append(np.min(chunk))
-                t_env.append(t[i])
+                t_env.append(t_ds[i])
         
         fig.add_trace(go.Scattergl(
             x=t_env, y=envelope_pos,
@@ -105,11 +129,11 @@ def create_time_domain_plot(signal, fs, title, color, show_envelope=False):
         ))
     
     fig.update_layout(
-        title=title, 
+        title=title,
         xaxis_title="Tempo (s)",
         yaxis_title="Amplitude",
-        template="plotly_dark", 
-        height=300, 
+        template="plotly_dark",
+        height=300,
         margin=dict(l=40, r=20, t=50, b=40),
         hovermode='x unified'
     )
@@ -123,10 +147,18 @@ def fig_to_bytes(fig, format='png'):
     return img_bytes
 
 
+def _make_coeffs_key(arch, **kwargs):
+    """Gera chave hashable única para identificar um filtro no cache."""
+    parts = [arch]
+    for k, v in sorted(kwargs.items()):
+        parts.append(f"{k}={v}")
+    return "|".join(parts)
+
+
 def render_layout():
     """Renders the main application layout."""
     st.set_page_config(
-        page_title="DSP Analytics Suite", 
+        page_title="DSP Analytics Suite",
         layout="wide",
         initial_sidebar_state="expanded"
     )
@@ -175,7 +207,6 @@ def render_layout():
             help="Selecione como deseja carregar o sinal"
         )
         
-        # Track if signal source changed
         signal_changed = False
         if st.session_state.get('last_source_type') != source_type:
             signal_changed = True
@@ -189,12 +220,19 @@ def render_layout():
             )
             if uploaded_file is not None:
                 try:
-                    fs, data = SignalProcessor.load_audio(uploaded_file)
+                    # CACHE: usa bytes para hashabilidade
+                    fs, data = cached_load_audio(uploaded_file.getvalue())
+                    
+                    # Trunca se muito longo (economia de RAM)
+                    max_samples = int(MAX_DURATION_SECONDS * fs)
+                    if len(data) > max_samples:
+                        data = data[:max_samples]
+                        st.warning(f"⚠️ Áudio truncado para {MAX_DURATION_SECONDS}s para economizar memória.")
+                    
                     st.session_state.signal = data
                     st.session_state.sampling_rate = fs
                     st.session_state.signal_source = f"upload_{uploaded_file.name}"
                     
-                    # Clear downstream states
                     st.session_state.pop('mixed_signal', None)
                     st.session_state.pop('filtered_signal', None)
                     st.session_state.pop('noise_ref', None)
@@ -209,7 +247,6 @@ def render_layout():
             
             if st.button("🔄 Carregar Arquivo de Exemplo", use_container_width=True):
                 try:
-                    # Try multiple possible paths
                     possible_paths = [
                         "audio_10s.wav",
                         "./audio_10s.wav",
@@ -220,12 +257,15 @@ def render_layout():
                     loaded = False
                     for path in possible_paths:
                         if os.path.exists(path):
-                            fs, data = SignalProcessor.load_audio(path)
+                            # Lê como bytes para usar o cache
+                            with open(path, 'rb') as f:
+                                file_bytes = f.read()
+                            fs, data = cached_load_audio(file_bytes)
+                            
                             st.session_state.signal = data
                             st.session_state.sampling_rate = fs
                             st.session_state.signal_source = "example_audio"
                             
-                            # Clear downstream states
                             st.session_state.pop('mixed_signal', None)
                             st.session_state.pop('filtered_signal', None)
                             st.session_state.pop('noise_ref', None)
@@ -309,19 +349,19 @@ def render_layout():
                 with st.spinner("Gerando sinal..."):
                     st.session_state.sampling_rate = fs_gen
                     
+                    # CACHE: funções cacheadas
                     if gen_type == "Ruído Branco":
-                        sig = SignalProcessor.generate_white_noise(int(N), int(seed))
+                        sig = cached_generate_white_noise(int(N), int(seed))
                     elif gen_type == "Ruído Impulsivo":
-                        sig = SignalProcessor.generate_impulsive_noise(int(N), int(seed))
+                        sig = cached_generate_impulsive_noise(int(N), int(seed))
                     elif gen_type == "Chirp":
-                        sig = SignalProcessor.generate_chirp_noise(int(N), fs_gen, f_start, f_end)
+                        sig = cached_generate_chirp_noise(int(N), fs_gen, f_start, f_end)
                     elif gen_type == "Alta Frequência (16kHz)":
-                        sig = SignalProcessor.generate_high_freq_noise(int(N), fs_gen, high_freq, int(seed))
+                        sig = cached_generate_high_freq_noise(int(N), fs_gen, high_freq, int(seed))
                     
                     st.session_state.signal = sig
                     st.session_state.signal_source = f"synthetic_{gen_type}_{seed}"
                     
-                    # Clear downstream states
                     st.session_state.pop('mixed_signal', None)
                     st.session_state.pop('filtered_signal', None)
                     st.session_state.pop('noise_ref', None)
@@ -362,19 +402,19 @@ def render_layout():
                     N = len(st.session_state.signal)
                     fs = st.session_state.sampling_rate
                     
-                    # Generate noise
+                    # CACHE: geração de ruído cacheada
                     if noise_type == "Branco":
-                        n = SignalProcessor.generate_white_noise(N)
+                        n = cached_generate_white_noise(N)
                     elif noise_type == "Impulsivo":
-                        n = SignalProcessor.generate_impulsive_noise(N)
+                        n = cached_generate_impulsive_noise(N)
                     elif noise_type == "Chirp":
-                        n = SignalProcessor.generate_chirp_noise(N, fs, 0, fs/2 - 100)
+                        n = cached_generate_chirp_noise(N, fs, 0, fs/2 - 100)
                     else:  # Alta Freq
                         high_f = min(16000.0, fs/2 - 100)
-                        n = SignalProcessor.generate_high_freq_noise(N, fs, high_f)
+                        n = cached_generate_high_freq_noise(N, fs, high_f)
                     
-                    # Mix signals
-                    mixed, scaled_noise = SignalProcessor.mix_signals(
+                    # CACHE: mixagem cacheada
+                    mixed, scaled_noise = cached_mix_signals(
                         st.session_state.signal, n, target_snr
                     )
                     
@@ -383,7 +423,6 @@ def render_layout():
                     st.session_state.last_snr = target_snr
                     st.session_state.last_noise_type = noise_type
                     
-                    # Clear filtered signal when new noise is applied
                     st.session_state.pop('filtered_signal', None)
                     
                     st.success(f"✅ Ruído aplicado! SNR = {target_snr} dB")
@@ -787,7 +826,6 @@ def render_layout():
         has_mix = 'mixed_signal' in st.session_state
         has_filt = 'filtered_signal' in st.session_state
         
-        # Determine number of columns
         n_cols = 1
         if has_mix:
             n_cols = 2
@@ -808,7 +846,6 @@ def render_layout():
             )
             st.plotly_chart(fig_orig, use_container_width=True)
             
-            # Download button
             img_bytes = fig_to_bytes(fig_orig)
             st.download_button(
                 "💾 Baixar Imagem",
@@ -833,7 +870,6 @@ def render_layout():
                 )
                 st.plotly_chart(fig_noisy, use_container_width=True)
                 
-                # Download button
                 img_bytes = fig_to_bytes(fig_noisy)
                 st.download_button(
                     "💾 Baixar Imagem",
@@ -858,7 +894,6 @@ def render_layout():
                 )
                 st.plotly_chart(fig_filt, use_container_width=True)
                 
-                # Download button
                 img_bytes = fig_to_bytes(fig_filt)
                 st.download_button(
                     "💾 Baixar Imagem",
@@ -967,7 +1002,6 @@ def render_layout():
             horizontal=True
         )
         
-        # Map signal name to actual signal
         sig_map = {
             "Original": st.session_state.signal,
             "Ruidoso": st.session_state.get('mixed_signal'),
@@ -981,7 +1015,6 @@ def render_layout():
         curr_sig = np.nan_to_num(curr_sig)
         fs = st.session_state.sampling_rate
         
-        # Sub-tabs for different spectral methods
         subtab1, subtab2, subtab3 = st.tabs([
             "FFT (Magnitude & Fase)",
             "STFT (Espectrograma)",
@@ -992,26 +1025,24 @@ def render_layout():
         with subtab1:
             st.markdown("### Transformada Rápida de Fourier (FFT)")
             
-            # Window selection
             window_type = st.selectbox(
                 "Janela para FFT",
                 ["hann", "hamming", "blackman", "rect"],
                 help="Tipo de janela aplicada antes da FFT"
             )
             
-            # Compute FFT
-            xf, mag, mag_db, phase = SignalProcessor.compute_fft(curr_sig, fs, window_type)
+            # CACHE: FFT cacheada
+            xf, mag, mag_db, phase = cached_compute_fft(curr_sig, fs, window_type)
             
-            # Downsample for plotting
-            x_p, _ = downsample_for_plot(xf, 5000)
-            m_p, _ = downsample_for_plot(mag, 5000)
-            m_db_p, _ = downsample_for_plot(mag_db, 5000)
-            p_p, _ = downsample_for_plot(phase, 5000)
+            # MINMAX: downsampling pareado (frequência x magnitude)
+            xf_ds, m_ds = downsample_xy(xf, mag, max_points=MAX_PLOT_POINTS, method='minmax')
+            xf_ds2, m_db_ds = downsample_xy(xf, mag_db, max_points=MAX_PLOT_POINTS, method='minmax')
+            xf_ds3, p_ds = downsample_xy(xf, phase, max_points=MAX_PLOT_POINTS, method='minmax')
             
             # Magnitude Plot (Linear)
             fig_mag = go.Figure()
             fig_mag.add_trace(go.Scattergl(
-                x=x_p, y=m_p,
+                x=xf_ds, y=m_ds,
                 name="Magnitude",
                 line=dict(color='#00CC96', width=1.5)
             ))
@@ -1034,7 +1065,7 @@ def render_layout():
             # Magnitude Plot (dB)
             fig_mag_db = go.Figure()
             fig_mag_db.add_trace(go.Scattergl(
-                x=x_p, y=m_db_p,
+                x=xf_ds2, y=m_db_ds,
                 name="Magnitude (dB)",
                 line=dict(color='#FFA15A', width=1.5)
             ))
@@ -1057,7 +1088,7 @@ def render_layout():
             # Phase Plot
             fig_phs = go.Figure()
             fig_phs.add_trace(go.Scattergl(
-                x=x_p, y=p_p,
+                x=xf_ds3, y=p_ds,
                 name="Fase",
                 line=dict(color='#AB63FA', width=1.5)
             ))
@@ -1101,21 +1132,20 @@ def render_layout():
             
             noverlap = int(n_win * overlap_pct / 100)
             
-            # Compute STFT
-            f, t, Zxx = SignalProcessor.compute_stft(
+            # CACHE: STFT cacheada
+            f, t, Zxx = cached_compute_stft(
                 curr_sig, fs,
                 nperseg=n_win,
                 noverlap=noverlap
             )
             mag_spec = 20 * np.log10(np.abs(Zxx) + 1e-12)
             
-            # Downsample for display if too large
-            if len(t) > 600:
-                step = len(t) // 600
+            # Downsample temporal do espectrograma
+            if len(t) > MAX_SPEC_TIME_BINS:
+                step = len(t) // MAX_SPEC_TIME_BINS
                 t = t[::step]
                 mag_spec = mag_spec[:, ::step]
             
-            # Create spectrogram
             fig_stft = go.Figure(data=go.Heatmap(
                 z=mag_spec,
                 x=t,
@@ -1138,12 +1168,15 @@ def render_layout():
                 mime="image/png"
             )
             
-            # Info box
             st.info(f"""
             **Resolução Temporal**: {n_win/fs*1000:.2f} ms  
             **Resolução Frequencial**: {fs/n_win:.2f} Hz  
             **Número de Frames**: {len(t)}
             """)
+            
+            # Libera matriz pesada
+            del Zxx, mag_spec
+            gc.collect()
         
         # --- CWT Analysis ---
         with subtab3:
@@ -1170,7 +1203,6 @@ def render_layout():
                 )
             
             # Downsample signal if too long for CWT
-            MAX_CWT_PTS = 4000
             if len(curr_sig) > MAX_CWT_PTS:
                 step = len(curr_sig) // MAX_CWT_PTS
                 sig_cwt = curr_sig[::step]
@@ -1180,15 +1212,12 @@ def render_layout():
                 sig_cwt = curr_sig
                 fs_cwt = fs
             
-            # Compute CWT
-            scales = np.arange(1, max_scale + 1)
-            coefs, freqs = SignalProcessor.compute_cwt(sig_cwt, fs_cwt, wavelet=wavelet, scales=scales)
+            # CACHE: CWT cacheada
+            coefs, freqs = cached_compute_cwt(sig_cwt, fs_cwt, wavelet=wavelet, num_scales=max_scale)
             power = np.abs(coefs)**2
             
-            # Time axis
             t_vals = np.linspace(0, len(curr_sig)/fs, len(sig_cwt))
             
-            # Create scalogram
             fig_cwt = go.Figure(data=go.Heatmap(
                 z=power,
                 x=t_vals,
@@ -1210,6 +1239,10 @@ def render_layout():
                 file_name="escalograma_cwt.png",
                 mime="image/png"
             )
+            
+            # Libera matrizes pesadas da CWT
+            del coefs, power
+            gc.collect()
 
     # =================================================================
     # TAB 3: STATISTICS
@@ -1217,7 +1250,6 @@ def render_layout():
     with tab_stats:
         st.subheader("📈 Estatísticas Avançadas e Distribuições")
         
-        # Signal selector
         signal_options = ["Original"]
         if has_mix:
             signal_options.append("Ruidoso")
@@ -1252,7 +1284,6 @@ def render_layout():
             
             st.divider()
             
-            # Histogram and Autocorrelation
             col1, col2 = st.columns(2)
             
             with col1:
@@ -1260,7 +1291,8 @@ def render_layout():
                 
                 bins = st.slider("Número de bins", 20, 200, 100, key="hist_bins")
                 
-                counts, bin_centers = SignalProcessor.compute_histogram(curr_stat_sig, bins=bins)
+                # CACHE: histograma cacheado
+                counts, bin_centers = cached_compute_histogram(curr_stat_sig, bins=bins)
                 
                 fig_hist = go.Figure()
                 fig_hist.add_trace(go.Bar(
@@ -1285,7 +1317,6 @@ def render_layout():
                     mime="image/png"
                 )
                 
-                # Distribution info
                 st.info(f"""
                 **Assimetria (Skewness)**: {np.mean((curr_stat_sig - np.mean(curr_stat_sig))**3) / (np.std(curr_stat_sig)**3):.3f}  
                 **Amplitude**: [{np.min(curr_stat_sig):.4f}, {np.max(curr_stat_sig):.4f}]
@@ -1301,16 +1332,16 @@ def render_layout():
                     key="acf_lag"
                 )
                 
-                lags, corr = SignalProcessor.compute_autocorrelation(curr_stat_sig, max_lag=max_lag)
+                # CACHE: autocorrelação cacheada
+                lags, corr = cached_compute_autocorrelation(curr_stat_sig, max_lag=max_lag)
                 lags_time = lags / st.session_state.sampling_rate
                 
-                # Downsample for plot
-                l_p, _ = downsample_for_plot(lags_time, 2000)
-                c_p, _ = downsample_for_plot(corr, 2000)
+                # MINMAX: downsampling pareado
+                l_ds, c_ds = downsample_xy(lags_time, corr, max_points=2000, method='minmax')
                 
                 fig_acf = go.Figure()
                 fig_acf.add_trace(go.Scattergl(
-                    x=l_p, y=c_p,
+                    x=l_ds, y=c_ds,
                     mode='lines',
                     name='ACF',
                     line=dict(color='cyan', width=1.5)
@@ -1331,7 +1362,6 @@ def render_layout():
                     mime="image/png"
                 )
                 
-                # Find first zero crossing
                 zero_crossings = np.where(np.diff(np.sign(corr)))[0]
                 if len(zero_crossings) > 0:
                     first_zero = lags_time[zero_crossings[0]]
@@ -1349,7 +1379,6 @@ def render_layout():
         with col_params:
             st.markdown("### Parâmetros do Filtro")
             
-            # Filter architecture
             arch = st.radio(
                 "Arquitetura",
                 ["FIR", "IIR"],
@@ -1360,7 +1389,6 @@ def render_layout():
             fs = st.session_state.sampling_rate
             nyq = fs / 2
             
-            # Filter type
             filter_type = st.selectbox(
                 "Tipo de Filtro",
                 ["Passa-Baixas", "Passa-Altas"],
@@ -1369,7 +1397,6 @@ def render_layout():
             pass_zero = (filter_type == "Passa-Baixas")
             btype = 'lowpass' if pass_zero else 'highpass'
             
-            # Cutoff frequency
             cutoff = st.number_input(
                 "Frequência de Corte (Hz)",
                 min_value=1.0,
@@ -1408,14 +1435,14 @@ def render_layout():
                     )
                     method_param = 'window'
                 else:
-                    window_fir = 'hamming'  # Not used for Parks-McClellan
+                    window_fir = 'hamming'
                     method_param = 'parks-mcclellan'
                 
-                # Design button
                 if st.button("⚙️ Projetar Filtro FIR", use_container_width=True):
                     with st.spinner("Projetando filtro FIR..."):
                         try:
-                            b = SignalProcessor.design_fir(
+                            # CACHE: design cacheado
+                            b = cached_design_fir(
                                 int(taps),
                                 cutoff,
                                 fs,
@@ -1424,6 +1451,10 @@ def render_layout():
                                 method=method_param
                             )
                             st.session_state.coeffs = (b, np.array([1.0]))
+                            st.session_state.coeffs_key = _make_coeffs_key(
+                                "FIR", taps=taps, cutoff=cutoff, fs=fs,
+                                window=window_fir, method=method_param
+                            )
                             st.session_state.filter_type = f"FIR-{fir_method}"
                             st.session_state.filter_order = len(b) - 1
                             st.success(f"✅ Filtro FIR projetado ({taps} taps, ordem {len(b)-1})")
@@ -1456,7 +1487,6 @@ def render_layout():
                     help="Ordem do filtro (inclinação da resposta)"
                 )
                 
-                # Ripple parameters (if applicable)
                 rp = 1.0
                 rs = 40.0
                 
@@ -1480,11 +1510,11 @@ def render_layout():
                         help="Atenuação mínima na banda rejeitada"
                     )
                 
-                # Design button
                 if st.button("⚙️ Projetar Filtro IIR", use_container_width=True):
                     with st.spinner("Projetando filtro IIR..."):
                         try:
-                            sos = SignalProcessor.design_iir(
+                            # CACHE: design cacheado
+                            sos = cached_design_iir(
                                 int(order),
                                 cutoff,
                                 fs,
@@ -1494,6 +1524,10 @@ def render_layout():
                                 rs=rs
                             )
                             st.session_state.coeffs = sos
+                            st.session_state.coeffs_key = _make_coeffs_key(
+                                "IIR", order=order, cutoff=cutoff, fs=fs,
+                                btype=btype, ftype=ftype, rp=rp, rs=rs
+                            )
                             st.session_state.filter_type = f"IIR-{ftype_display}"
                             st.session_state.filter_order = order
                             st.success(f"✅ Filtro IIR projetado (Ordem {order})")
@@ -1515,12 +1549,13 @@ def render_layout():
                 else:
                     with st.spinner("Aplicando filtro..."):
                         try:
-                            # Choose signal to filter
                             target = st.session_state.get('mixed_signal', st.session_state.signal)
                             
-                            # Apply filter
-                            filt = SignalProcessor.apply_filter(
+                            # CACHE: apply_filter cacheado
+                            coeffs_key = st.session_state.get('coeffs_key', 'unknown')
+                            filt = cached_apply_filter(
                                 target,
+                                coeffs_key,
                                 st.session_state.coeffs,
                                 zero_phase=zero_phase
                             )
@@ -1538,23 +1573,21 @@ def render_layout():
             
             if 'coeffs' in st.session_state:
                 try:
-                    # Analyze filter
-                    res = SignalProcessor.analyze_filter(st.session_state.coeffs, fs)
+                    # CACHE: análise do filtro cacheada
+                    coeffs_key = st.session_state.get('coeffs_key', 'unknown')
+                    res = cached_analyze_filter(coeffs_key, st.session_state.coeffs, fs)
                     
-                    # Show filter order
                     st.info(f"**Ordem do Filtro**: {st.session_state.get('filter_order', 'N/A')}")
                     
                     # Magnitude Response
                     st.markdown("#### Resposta em Magnitude")
                     
-                    # Create subplot with linear and dB
                     fig_mag = make_subplots(
                         rows=2, cols=1,
                         subplot_titles=("Magnitude (Linear)", "Magnitude (dB)"),
                         vertical_spacing=0.12
                     )
                     
-                    # Linear magnitude
                     fig_mag.add_trace(
                         go.Scattergl(
                             x=res['w'],
@@ -1565,7 +1598,6 @@ def render_layout():
                         row=1, col=1
                     )
                     
-                    # dB magnitude
                     fig_mag.add_trace(
                         go.Scattergl(
                             x=res['w'],
@@ -1576,7 +1608,6 @@ def render_layout():
                         row=2, col=1
                     )
                     
-                    # Add cutoff frequency line
                     fig_mag.add_vline(x=cutoff, line_dash="dash", line_color="red", opacity=0.5, row="all")
                     
                     fig_mag.update_xaxes(title_text="Frequência (Hz)", row=2, col=1)
@@ -1601,10 +1632,9 @@ def render_layout():
                     # Passband detail (zoom)
                     st.markdown("#### Detalhe da Banda Passante (Ripple)")
                     
-                    # Determine passband frequency range
-                    if pass_zero:  # Lowpass
+                    if pass_zero:
                         pb_mask = res['w'] <= cutoff * 1.2
-                    else:  # Highpass
+                    else:
                         pb_mask = res['w'] >= cutoff * 0.8
                     
                     fig_ripple = go.Figure()
@@ -1631,7 +1661,7 @@ def render_layout():
                         mime="image/png"
                     )
                     
-                    # Phase Response and Group Delay (Side by side)
+                    # Phase Response and Group Delay
                     col1, col2 = st.columns(2)
                     
                     with col1:
@@ -1690,7 +1720,7 @@ def render_layout():
                             key="download_gd"
                         )
                     
-                    # Pole-Zero Plot and Impulse Response (Side by side)
+                    # Pole-Zero Plot and Impulse Response
                     st.markdown("### Análise no Domínio Z e Temporal")
                     
                     col1, col2 = st.columns(2)
@@ -1701,7 +1731,6 @@ def render_layout():
                         if len(res['p']) > 0 or len(res['z']) > 0:
                             fig_pz = go.Figure()
                             
-                            # Unit circle
                             theta = np.linspace(0, 2*np.pi, 100)
                             fig_pz.add_trace(go.Scattergl(
                                 x=np.cos(theta),
@@ -1711,7 +1740,6 @@ def render_layout():
                                 line=dict(color='gray', dash='dash')
                             ))
                             
-                            # Zeros
                             if len(res['z']) > 0:
                                 fig_pz.add_trace(go.Scattergl(
                                     x=np.real(res['z']),
@@ -1721,7 +1749,6 @@ def render_layout():
                                     marker=dict(symbol='circle-open', size=12, color='blue', line=dict(width=2))
                                 ))
                             
-                            # Poles
                             if len(res['p']) > 0:
                                 fig_pz.add_trace(go.Scattergl(
                                     x=np.real(res['p']),
@@ -1751,7 +1778,6 @@ def render_layout():
                     with col2:
                         st.markdown("#### Resposta ao Impulso")
                         
-                        # Compute impulse response
                         h = SignalProcessor.compute_impulse_response(st.session_state.coeffs, num_samples=100)
                         n = np.arange(len(h))
                         
@@ -1802,7 +1828,7 @@ def render_layout():
             else:
                 st.info("👈 Projete um filtro para visualizar suas características")
             
-            # Residual Analysis (if filter applied)
+            # Residual Analysis
             if 'filtered_signal' in st.session_state and 'mixed_signal' in st.session_state:
                 st.divider()
                 st.markdown("### 🔍 Análise de Resíduos")
@@ -1811,11 +1837,9 @@ def render_layout():
                 orig = st.session_state.mixed_signal
                 filt = st.session_state.filtered_signal
                 
-                # Equalize lengths
                 L = min(len(orig), len(filt))
                 residual = orig[:L] - filt[:L]
                 
-                # Time domain residual
                 fig_res = create_time_domain_plot(
                     residual,
                     st.session_state.sampling_rate,
@@ -1831,7 +1855,6 @@ def render_layout():
                     key="download_residual"
                 )
                 
-                # Residual statistics
                 col1, col2, col3, col4 = st.columns(4)
                 col1.metric("RMS do Resíduo", f"{np.sqrt(np.mean(residual**2)):.4f}")
                 col2.metric("Energia Removida", f"{np.sum(residual**2):.2e}")
@@ -1892,26 +1915,23 @@ def render_layout():
                 if st.button("🚀 Executar LMS", use_container_width=True, type="primary"):
                     with st.spinner("Executando algoritmo LMS..."):
                         try:
-                            # Create LMS filter
-                            lms = LMSFilter(int(taps), mu)
-                            
-                            # Normalize signals for numerical stability
                             d = st.session_state.mixed_signal
                             x = st.session_state.noise_ref
                             
-                            # Ensure same length
                             min_len = min(len(d), len(x))
                             d = d[:min_len]
                             x = x[:min_len]
                             
                             norm_fact = np.max(np.abs(d)) + 1e-9
                             
-                            # Run LMS
-                            y, e, w, mse_history = lms.run(x/norm_fact, d/norm_fact)
+                            # CACHE: LMS cacheado
+                            y, e, w, mse_history = cached_lms_filter(
+                                x/norm_fact, d/norm_fact,
+                                int(taps), mu
+                            )
                             
-                            # Store results (restore scale)
-                            st.session_state.lms_output = e * norm_fact  # Error signal = cleaned signal
-                            st.session_state.lms_noise_est = y * norm_fact  # Estimated noise
+                            st.session_state.lms_output = e * norm_fact
+                            st.session_state.lms_noise_est = y * norm_fact
                             st.session_state.lms_mse = mse_history * (norm_fact**2)
                             st.session_state.lms_weights = w
                             
@@ -1949,14 +1969,14 @@ def render_layout():
                     
                     mse_db = 10 * np.log10(st.session_state.lms_mse + 1e-12)
                     
-                    # Downsample for plot
-                    mse_p, _ = downsample_for_plot(mse_db, 5000)
-                    n_samples = np.linspace(0, len(st.session_state.lms_mse), len(mse_p))
+                    # MINMAX: downsampling pareado
+                    n_full = np.linspace(0, len(st.session_state.lms_mse), len(mse_db))
+                    n_ds, mse_ds = downsample_xy(n_full, mse_db, max_points=MAX_PLOT_POINTS, method='minmax')
                     
                     fig_mse = go.Figure()
                     fig_mse.add_trace(go.Scattergl(
-                        x=n_samples,
-                        y=mse_p,
+                        x=n_ds,
+                        y=mse_ds,
                         mode='lines',
                         name='MSE (dB)',
                         line=dict(color='#FFA15A', width=1.5)
@@ -1981,14 +2001,13 @@ def render_layout():
                     # Performance Metrics
                     st.markdown("#### Métricas de Performance")
                     
-                    # Compare with original
-                    snr_lms, psnr_lms = SignalProcessor.compute_snr(
+                    # CACHE: SNR cacheado
+                    snr_lms, psnr_lms = cached_compute_snr(
                         st.session_state.signal[:len(st.session_state.lms_output)],
                         st.session_state.lms_output
                     )
                     
-                    # Initial SNR (from mixed signal)
-                    snr_init, psnr_init = SignalProcessor.compute_snr(
+                    snr_init, psnr_init = cached_compute_snr(
                         st.session_state.signal[:len(st.session_state.mixed_signal)],
                         st.session_state.mixed_signal
                     )
